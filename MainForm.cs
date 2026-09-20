@@ -9,7 +9,7 @@ internal sealed class MainForm : Form
 {
     private const int VkXButton1 = 0x05;
     private const int VkXButton2 = 0x06;
-    private const int VkRightButton = 0x02;
+    private const int VkLeftButton = 0x01;
 
     private readonly ComboBox _sideButton = new()
     {
@@ -32,7 +32,7 @@ internal sealed class MainForm : Form
     {
         Location = new Point(20, 83),
         Size = new Size(348, 34),
-        Text = "Bloquear a ação original do botão lateral (voltar/avançar)",
+        Text = "Bloquear a ação original do lateral (voltar/avançar)",
         Checked = true
     };
 
@@ -58,7 +58,7 @@ internal sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "AutoClick - Botão lateral → direito";
+        Text = "AutoClick - Lateral → clique esquerdo";
         ClientSize = new Size(387, 225);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
@@ -71,7 +71,7 @@ internal sealed class MainForm : Form
         _sideButton.Items.AddRange(new object[] { "Lateral 1 (Voltar)", "Lateral 2 (Avançar)" });
         _sideButton.SelectedIndex = 0;
         _timer.Interval = 1000 / (int)_clicksPerSecond.Value;
-        _timer.Tick += (_, _) => SendRightClick(checkPhysicalState: true);
+        _timer.Tick += (_, _) => SendLeftClick(checkPhysicalState: true);
         _clicksPerSecond.ValueChanged += (_, _) =>
             _timer.Interval = Math.Max(1, (int)Math.Round(1000m / _clicksPerSecond.Value));
         _sideButton.SelectedIndexChanged += (_, _) =>
@@ -88,8 +88,8 @@ internal sealed class MainForm : Form
             UpdateStatus();
         };
 
-        // Hook serve apenas para bloquear opcionalmente o lateral e detectar
-        // sua soltura como redundância. Ele nunca intercepta o botão direito.
+        // Hook só observa a soltura do lateral e opcionalmente bloqueia Voltar/Avançar.
+        // Jamais intercepta o clique direito ou esquerdo físico.
         _hook = new MouseHook(OnSideButton);
         UpdateStatus();
     }
@@ -121,21 +121,21 @@ internal sealed class MainForm : Form
         if (m.Msg == RawMouseInput.WmInput && _ready &&
             RawMouseInput.TryGetButtonFlags(m.LParam, out ushort flags))
         {
-            // Entrada física informa tanto o lateral quanto o direito REAL.
-            // Eventos injetados via SendInput não geram esse mesmo sinal.
+            // WM_INPUT relata o lateral físico e o estado do esquerdo REAL,
+            // sem confundir cliques que nós próprios injetamos.
             var transition = _hold.OnRawMouseButtons(flags);
             switch (transition)
             {
                 case HoldState.Transition.Started:
                     _timer.Start();
                     UpdateStatus();
-                    SendRightClick(checkPhysicalState: false);
+                    SendLeftClick(checkPhysicalState: false);
                     break;
                 case HoldState.Transition.Stopped:
                     StopClicking();
                     break;
                 default:
-                    if (_hold.Held && (flags & (0x0004 | 0x0008)) != 0)
+                    if (_hold.Held && (flags & (0x0001 | 0x0002)) != 0)
                         UpdateStatus();
                     break;
             }
@@ -147,25 +147,23 @@ internal sealed class MainForm : Form
     private bool OnSideButton(int button, bool down)
     {
         if (button == _hold.SelectedButton && !down)
-            StopClicking();
+            StopClicking(); // Redundância caso a soltura não chegue pelo Raw Input.
 
-        // Nunca transforma nem suprime eventos do botão direito físico.
         return _hold.Enabled && button == _hold.SelectedButton && _suppressOriginal.Checked;
     }
 
-    private void SendRightClick(bool checkPhysicalState)
+    private void SendLeftClick(bool checkPhysicalState)
     {
         if (!_ready || !_hold.CanClick)
             return;
 
-        // Proteção adicional contra qualquer atraso/perda de WM_INPUT:
-        // SendInput enviaria RIGHTUP e poderia soltar o botão REAL que a pessoa
-        // está segurando. Nessa situação não geramos evento sintético algum.
-        if ((GetAsyncKeyState(VkRightButton) & 0x8000) != 0)
+        // Nunca injeta LEFTUP enquanto o esquerdo real está segurado: evita
+        // cancelar disparo contínuo/arrastar selecionado pelo usuário.
+        if ((GetAsyncKeyState(VkLeftButton) & 0x8000) != 0)
             return;
 
-        // Se o lateral não estiver bloqueado pelo hook, consultamos também
-        // seu estado físico em cada tick; soltar interrompe o timer.
+        // Sem bloqueio do lateral, o estado do Windows serve como verificação extra.
+        // Com bloqueio, GetAsyncKeyState pode não atualizar: WM_INPUT e hook cuidam do UP.
         if (checkPhysicalState && !_suppressOriginal.Checked)
         {
             int key = _hold.SelectedButton == 1 ? VkXButton1 : VkXButton2;
@@ -176,7 +174,7 @@ internal sealed class MainForm : Form
             }
         }
 
-        if (!MouseSender.RightClick())
+        if (!MouseSender.LeftClick())
         {
             StopClicking();
             _status.Text = "Windows bloqueou o clique. Verifique as permissões da janela.";
@@ -196,11 +194,11 @@ internal sealed class MainForm : Form
             ? "Inicializando... autoclick desativado."
             : !_hold.Enabled
                 ? "Pausado. Clique em Ativar para habilitar."
-                : _hold.Held && _hold.PhysicalRightHeld
-                    ? "Direito físico pressionado: autoclick suspenso."
+                : _hold.Held && _hold.PhysicalLeftHeld
+                    ? "Esquerdo físico pressionado: autoclick suspenso."
                     : _hold.Held
-                        ? "Clicando... Solte o lateral para parar."
-                        : "Pronto. Segure o lateral escolhido para clicar.";
+                        ? "Clicando esquerdo... Solte o lateral para parar."
+                        : "Pronto. Segure o lateral; direito segue para mirar.";
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)

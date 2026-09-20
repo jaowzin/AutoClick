@@ -18,6 +18,8 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+      - name: Testar comportamento de segurar e soltar
+        run: dotnet run --project tests/StateTests.csproj --configuration Release
       - name: Compilar EXE portátil para Windows x64
         run: dotnet publish AutoClick.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:PublishTrimmed=false -p:DebugType=none -p:DebugSymbols=false -o dist
       - name: Validar o executável

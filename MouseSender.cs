@@ -10,14 +10,28 @@ internal static class MouseSender
 
     public static bool LeftClick()
     {
-        // O programa injeta SOMENTE clique esquerdo; o botão direito nunca é alterado.
+        // Envia pressionar e soltar no MESMO lote. Nunca altera o botão direito.
+        var release = new Input
+        {
+            Type = MouseInput,
+            Data = new InputUnion { Mouse = new MouseInputData { Flags = LeftUp } }
+        };
         var inputs = new[]
         {
             new Input { Type = MouseInput, Data = new InputUnion { Mouse = new MouseInputData { Flags = LeftDown } } },
-            new Input { Type = MouseInput, Data = new InputUnion { Mouse = new MouseInputData { Flags = LeftUp } } }
+            release
         };
 
-        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>()) == (uint)inputs.Length;
+        uint sent = SendInput(2, inputs, Marshal.SizeOf<Input>());
+        if (sent == 2)
+            return true;
+
+        // Falha parcial rara: se LEFTDOWN foi aceito mas LEFTUP não, tenta
+        // liberar imediatamente antes de a interface desativar o autoclick.
+        // Não injeta UP se DOWN não foi enviado.
+        if (sent == 1)
+            SendInput(1, new[] { release }, Marshal.SizeOf<Input>());
+        return false;
     }
 
     [StructLayout(LayoutKind.Sequential)]

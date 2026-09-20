@@ -44,8 +44,8 @@ internal sealed class MainForm : Form
         Enabled = false
     };
 
-    // Timer verifica o botão físico a cada tick; a cadência dos cliques é
-    // controlada separadamente pelo relógio monotônico.
+    // O timer verifica a pressão física a cada tick; um relógio separado
+    // controla a cadência dos cliques sem perder a verificação de soltura.
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 10 };
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly HoldState _hold = new();
@@ -112,8 +112,8 @@ internal sealed class MainForm : Form
             switch (_hold.OnRawMouseButtons(flags))
             {
                 case HoldState.Transition.Started:
-                    // NÃO injeta imediatamente: aguarda o estado de XBUTTON
-                    // ser atualizado pelo Windows e validado no próximo tick.
+                    // Aguarda o estado de XBUTTON atualizar e verifica no timer.
+                    // Nunca injeta clique só porque chegou um evento DOWN.
                     _lastClickMs = -1;
                     _timer.Start();
                     UpdateStatus();
@@ -138,19 +138,20 @@ internal sealed class MainForm : Form
             return;
         }
 
-        // A verificação física é OBRIGATÓRIA em TODOS os cliques. Não há
-        // hook para bloquear o lateral, pois ele pode impedir a atualização
-        // de GetAsyncKeyState e deixar o autoclick preso após soltar.
+        // Confirma o botão lateral real ANTES DE CADA CLIQUE. Sem hook de
+        // bloqueio, o estado assíncrono do Windows continua confiável.
         int side = _hold.SelectedButton == 1 ? VkXButton1 : VkXButton2;
-        if ((GetAsyncKeyState(side) & 0x8000) == 0)
+        bool sideDown = (GetAsyncKeyState(side) & 0x8000) != 0;
+        if (!sideDown)
         {
             StopClicking();
             return;
         }
 
-        // Não envia LEFTUP sintético sobre um botão esquerdo real segurado.
-        // O direito físico nunca é capturado nem alterado.
-        if (!_hold.CanClick || (GetAsyncKeyState(VkLeftButton) & 0x8000) != 0)
+        // Não solta virtualmente o esquerdo físico que a pessoa está segurando.
+        // Botão direito não é interceptado, reconfigurado nem enviado.
+        bool leftDown = (GetAsyncKeyState(VkLeftButton) & 0x8000) != 0;
+        if (!_hold.CanClickWithPhysicalState(sideDown, leftDown))
             return;
 
         long nowMs = _clock.ElapsedMilliseconds;
@@ -160,7 +161,7 @@ internal sealed class MainForm : Form
 
         if (!MouseSender.LeftClick())
         {
-            _hold.SetEnabled(false); // Em erro, falha fechado.
+            _hold.SetEnabled(false); // Falha fechado se SendInput não confirmar.
             StopClicking();
             _toggle.Text = "Ativar autoclick";
             _status.Text = "Falha ao enviar clique; autoclick pausado por segurança.";

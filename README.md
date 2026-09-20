@@ -1,21 +1,27 @@
 # AutoClick para Windows
 
-Programa simples que envia cliques direitos repetidos enquanto um botão lateral do mouse estiver pressionado. O botão direito físico continua funcionando.
+Autoclick de botão direito para mouse com botão lateral: **só clica enquanto o lateral escolhido estiver realmente pressionado**. Ao soltar, o clique para. O botão direito original continua funcionando sem remapeamento.
 
 ## Baixar
 
-Abra a aba [Actions](../../actions) deste repositório, selecione a execução concluída do workflow "Compilar AutoClick (Windows)" e baixe o artifact `AutoClick-Windows-x64`. Extraia o ZIP e abra `AutoClick.exe` no Windows 10 ou 11 de 64 bits. Não precisa instalar o .NET.
+Na aba **Actions**, abra a execução mais recente com selo verde do workflow "Compilar AutoClick (Windows)". Baixe o artifact `AutoClick-Windows-x64`, extraia o ZIP e execute `AutoClick.exe` no Windows 10/11 de 64 bits. Evite versões antigas: a primeira versão podia continuar clicando após perder um evento de soltura.
 
 ## Usar
 
-Escolha o botão lateral 1 ou 2 e configure entre 1 e 40 cliques por segundo. Segure o lateral para iniciar; solte para parar. A opção de bloquear a ação original evita que o botão lateral navegue para trás ou para a frente. Clique em "Pausar autoclick" para desativar o recurso.
+1. Feche qualquer `AutoClick.exe` antigo no Gerenciador de Tarefas antes de abrir o novo.
+2. Escolha "Lateral 1 (Voltar)" ou "Lateral 2 (Avançar)" e ajuste entre 1 e 40 cliques por segundo.
+3. Clique em **Ativar autoclick**. Ele inicia pausado por segurança.
+4. Segure o lateral selecionado para clicar; solte para parar. Clique em **Pausar autoclick** para desativar imediatamente.
 
-O programa continua funcionando enquanto sua janela estiver aberta, mesmo em segundo plano. O CPS é aproximado e depende do timer do Windows. Algumas janelas com permissões mais altas podem bloquear os cliques sintéticos.
+A opção de bloquear a ação original do lateral evita voltar/avançar no navegador. O programa recebe eventos físicos de mouse pelo Windows Raw Input, separados dos cliques virtuais enviados por SendInput, e também usa o evento de soltura do hook como redundância. Quando o bloqueio original estiver desativado, confere ainda o estado do botão com `GetAsyncKeyState` em cada tick.
+
+Se o software do seu mouse remapeia o botão lateral para uma tecla do teclado ou macro, configure-o como **Mouse Button 4 / Mouse Button 5** para que o Windows receba o botão físico. O funcionamento com seu modelo específico de mouse ainda precisa ser testado. A velocidade depende do timer do Windows.
 
 ## Compilar localmente
 
 Instale o SDK .NET 8 e execute no Windows:
 
 ```powershell
+dotnet run --project tests/StateTests.csproj --configuration Release
 dotnet publish AutoClick.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:PublishTrimmed=false -o dist
 ```

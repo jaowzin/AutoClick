@@ -8,4 +8,7 @@
     <AssemblyName>AutoClick</AssemblyName>
     <RootNamespace>AutoClick</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
+  </ItemGroup>
 </Project>

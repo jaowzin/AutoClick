@@ -1,10 +1,15 @@
+using System.ComponentModel;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace AutoClick;
 
 internal sealed class MainForm : Form
 {
+    private const int VkXButton1 = 0x05;
+    private const int VkXButton2 = 0x06;
+
     private readonly ComboBox _sideButton = new()
     {
         DropDownStyle = ComboBoxStyle.DropDownList,
@@ -41,13 +46,14 @@ internal sealed class MainForm : Form
     {
         Location = new Point(20, 170),
         Size = new Size(347, 38),
-        Text = "Pausar autoclick"
+        Text = "Ativar autoclick",
+        Enabled = false // Só permite ativar depois de registrar a entrada física.
     };
 
     private readonly System.Windows.Forms.Timer _timer = new();
+    private readonly HoldState _hold = new();
     private readonly MouseHook _hook;
-    private bool _enabled = true;
-    private bool _held;
+    private bool _ready;
 
     public MainForm()
     {
@@ -64,53 +70,99 @@ internal sealed class MainForm : Form
         _sideButton.Items.AddRange(new object[] { "Lateral 1 (Voltar)", "Lateral 2 (Avançar)" });
         _sideButton.SelectedIndex = 0;
         _timer.Interval = 1000 / (int)_clicksPerSecond.Value;
-        _timer.Tick += (_, _) => SendRightClick();
+        _timer.Tick += (_, _) => SendRightClick(checkPhysicalState: true);
         _clicksPerSecond.ValueChanged += (_, _) =>
             _timer.Interval = Math.Max(1, (int)Math.Round(1000m / _clicksPerSecond.Value));
-        _sideButton.SelectedIndexChanged += (_, _) => StopClicking();
+        _sideButton.SelectedIndexChanged += (_, _) =>
+        {
+            _hold.SelectButton(_sideButton.SelectedIndex + 1);
+            StopClicking();
+        };
 
         _toggle.Click += (_, _) =>
         {
-            _enabled = !_enabled;
-            if (!_enabled) StopClicking();
-            _toggle.Text = _enabled ? "Pausar autoclick" : "Ativar autoclick";
+            _timer.Stop();
+            _hold.SetEnabled(!_hold.Enabled);
+            _toggle.Text = _hold.Enabled ? "Pausar autoclick" : "Ativar autoclick";
             UpdateStatus();
         };
 
+        // Este hook SOMENTE bloqueia a ação original opcional e observa o UP
+        // como segunda proteção. Quem pode INICIAR cliques é apenas WM_INPUT físico.
         _hook = new MouseHook(OnSideButton);
-        _hook.Start();
         UpdateStatus();
     }
 
-    // O hook global é instalado na thread da interface: os eventos chegam nesta mesma thread.
-    private bool OnSideButton(int button, bool down)
+    protected override void OnShown(EventArgs e)
     {
-        if (!_enabled || button != _sideButton.SelectedIndex + 1)
-            return false;
-
-        if (down)
+        base.OnShown(e);
+        try
         {
-            if (!_held)
-            {
-                _held = true;
-                _timer.Start();
-                UpdateStatus();
-                SendRightClick(); // Primeiro clique imediato; os demais seguem a velocidade escolhida.
-            }
+            RawMouseInput.Register(Handle);
+            _hook.Start();
+            _ready = true;
+            _toggle.Enabled = true;
         }
-        else
+        catch (Win32Exception ex)
         {
-            StopClicking();
+            _ready = false;
+            _timer.Stop();
+            _hold.SetEnabled(false);
+            _toggle.Enabled = false; // Falha segura: nunca clica sem monitoramento.
+            MessageBox.Show(this, ex.Message, "AutoClick: erro de inicialização",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
-
-        // Não transforma nem bloqueia o botão direito físico; apenas o lateral escolhido.
-        return _suppressOriginal.Checked;
+        UpdateStatus();
     }
 
-    private void SendRightClick()
+    protected override void WndProc(ref Message m)
     {
-        if (!_enabled || !_held)
+        if (m.Msg == RawMouseInput.WmInput && _ready &&
+            RawMouseInput.TryGetButtonFlags(m.LParam, out ushort flags))
+        {
+            switch (_hold.OnRawMouseButtons(flags))
+            {
+                case HoldState.Transition.Started:
+                    _timer.Start();
+                    UpdateStatus();
+                    SendRightClick(checkPhysicalState: false); // Primeiro clique no DOWN real.
+                    break;
+                case HoldState.Transition.Stopped:
+                    StopClicking(); // UP físico encerra antes do próximo tick.
+                    break;
+            }
+        }
+
+        base.WndProc(ref m); // Permite ao Windows finalizar o processamento de WM_INPUT.
+    }
+
+    private bool OnSideButton(int button, bool down)
+    {
+        if (button == _hold.SelectedButton && !down)
+            StopClicking(); // Fallback: UP do hook, independente do evento Raw Input.
+
+        // Nunca remapeia nem bloqueia o botão direito físico.
+        return _hold.Enabled && button == _hold.SelectedButton && _suppressOriginal.Checked;
+    }
+
+    private void SendRightClick(bool checkPhysicalState)
+    {
+        if (!_ready || !_hold.CanClick)
             return;
+
+        // Quando não bloqueamos o botão lateral, checamos também o estado
+        // atual do Windows em CADA tick: se soltou, nenhum clique é enviado.
+        // Se o hook bloqueia o lateral, o GetAsyncKeyState pode não ser atualizado;
+        // nesse modo, WM_INPUT físico + UP do hook são as fontes de estado.
+        if (checkPhysicalState && !_suppressOriginal.Checked)
+        {
+            int key = _hold.SelectedButton == 1 ? VkXButton1 : VkXButton2;
+            if ((GetAsyncKeyState(key) & 0x8000) == 0)
+            {
+                StopClicking();
+                return;
+            }
+        }
 
         if (!MouseSender.RightClick())
         {
@@ -122,24 +174,30 @@ internal sealed class MainForm : Form
     private void StopClicking()
     {
         _timer.Stop();
-        _held = false;
+        _hold.Stop();
         UpdateStatus();
     }
 
     private void UpdateStatus()
     {
-        _status.Text = !_enabled
-            ? "Pausado. Os botões do mouse funcionam normalmente."
-            : _held
-                ? "Clicando... Solte o botão lateral para parar."
-                : "Ativo. Segure o botão lateral escolhido para clicar.";
+        _status.Text = !_ready
+            ? "Inicializando... autoclick desativado."
+            : !_hold.Enabled
+                ? "Pausado. Clique em Ativar para habilitar."
+                : _hold.Held
+                    ? "Clicando... Solte o lateral para parar imediatamente."
+                    : "Pronto. Segure o lateral escolhido para clicar.";
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         _timer.Stop();
+        _hold.SetEnabled(false);
         _hook.Dispose();
         _timer.Dispose();
         base.OnFormClosed(e);
     }
+
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int virtualKey);
 }

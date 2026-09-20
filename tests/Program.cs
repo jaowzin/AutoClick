@@ -19,8 +19,18 @@ Check(state.OnRawMouseButtons(0x0040) == HoldState.Transition.Started && state.C
     "pressionar lateral selecionado inicia cliques");
 Check(state.OnRawMouseButtons(0x0040) == HoldState.Transition.None && state.CanClick,
     "DOWN repetido nao gera nova ativacao");
+Check(state.OnRawMouseButtons(0x0004) == HoldState.Transition.None && !state.CanClick && state.PhysicalRightHeld,
+    "pressionar direito real suspende autoclick sem soltar lateral");
+Check(state.OnRawMouseButtons(0x0000) == HoldState.Transition.None && !state.CanClick,
+    "mover mouse com direito real pressionado nao reativa autoclick");
+Check(state.OnRawMouseButtons(0x0008) == HoldState.Transition.None && state.CanClick && !state.PhysicalRightHeld,
+    "soltar direito real retoma apenas se lateral continua segurado");
+Check(state.OnRawMouseButtons(0x0004) == HoldState.Transition.None && !state.CanClick,
+    "segurar direito real suspende novamente");
 Check(state.OnRawMouseButtons(0x0080) == HoldState.Transition.Stopped && !state.CanClick,
-    "soltar lateral para imediatamente");
+    "soltar lateral para mesmo com direito real segurado");
+Check(state.OnRawMouseButtons(0x0008) == HoldState.Transition.None && !state.CanClick,
+    "soltar direito real depois do lateral nao reinicia nada");
 Check(state.OnRawMouseButtons(0x0080) == HoldState.Transition.None && !state.CanClick,
     "UP repetido nao volta a clicar");
 

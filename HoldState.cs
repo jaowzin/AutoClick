@@ -1,6 +1,6 @@
 namespace AutoClick;
 
-// Apenas o botão lateral FÍSICO selecionado inicia; soltar sempre interrompe.
+// Apenas o lateral FÍSICO selecionado inicia; soltar sempre interrompe.
 internal sealed class HoldState
 {
     internal enum Transition { None, Started, Stopped }
@@ -10,14 +10,18 @@ internal sealed class HoldState
     public bool PhysicalLeftHeld { get; private set; }
     public int SelectedButton { get; private set; } = 1;
 
-    // LEFTUP sintético não pode interromper um LEFTDOWN físico do usuário.
     // O direito físico é independente: pode mirar enquanto o lateral atira.
     public bool CanClick => Enabled && Held && !PhysicalLeftHeld;
+
+    // Porta final: estado baseado em evento NÃO basta; sem confirmação
+    // independente do botão lateral, nenhum clique pode ser emitido.
+    public bool CanClickWithPhysicalState(bool sideActuallyDown, bool leftActuallyDown)
+        => CanClick && sideActuallyDown && !leftActuallyDown;
 
     public void SetEnabled(bool enabled)
     {
         Enabled = enabled;
-        Held = false; // Exige novo pressionamento real depois de reativar.
+        Held = false; // Reativar exige novo pressionamento real.
     }
 
     public void SelectButton(int button)
@@ -30,30 +34,27 @@ internal sealed class HoldState
 
     public void Stop() => Held = false;
 
-    // Flags do WM_INPUT físico: eventos sintéticos de SendInput não ativam o lateral.
+    // Flags de WM_INPUT vêm do mouse físico, não de SendInput.
     public Transition OnRawMouseButtons(ushort flags)
     {
-        const ushort leftDown = 0x0001; // RI_MOUSE_LEFT_BUTTON_DOWN
-        const ushort leftUp = 0x0002;   // RI_MOUSE_LEFT_BUTTON_UP
+        const ushort leftDown = 0x0001;
+        const ushort leftUp = 0x0002;
         if ((flags & leftDown) != 0) PhysicalLeftHeld = true;
         if ((flags & leftUp) != 0) PhysicalLeftHeld = false;
 
         ushort down = SelectedButton == 1 ? (ushort)0x0040 : (ushort)0x0100;
         ushort up = SelectedButton == 1 ? (ushort)0x0080 : (ushort)0x0200;
-
         if ((flags & up) != 0)
         {
             if (!Held) return Transition.None;
             Held = false;
             return Transition.Stopped;
         }
-
         if (Enabled && (flags & down) != 0 && !Held)
         {
             Held = true;
             return Transition.Started;
         }
-
         return Transition.None;
     }
 }

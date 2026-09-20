@@ -5,17 +5,16 @@ namespace AutoClick;
 internal static class MouseSender
 {
     private const uint MouseInput = 0;
-    private const uint RightDown = 0x0008;
-    private const uint RightUp = 0x0010;
+    private const uint LeftDown = 0x0002;
+    private const uint LeftUp = 0x0004;
 
-    public static bool RightClick()
+    public static bool LeftClick()
     {
-        // Dois eventos independentes: pressionar e soltar o botão direito virtual.
-        // O botão direito físico não é remapeado e continua disponível normalmente.
+        // O programa injeta SOMENTE clique esquerdo; o botão direito nunca é alterado.
         var inputs = new[]
         {
-            new Input { Type = MouseInput, Data = new InputUnion { Mouse = new MouseInputData { Flags = RightDown } } },
-            new Input { Type = MouseInput, Data = new InputUnion { Mouse = new MouseInputData { Flags = RightUp } } }
+            new Input { Type = MouseInput, Data = new InputUnion { Mouse = new MouseInputData { Flags = LeftDown } } },
+            new Input { Type = MouseInput, Data = new InputUnion { Mouse = new MouseInputData { Flags = LeftUp } } }
         };
 
         return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>()) == (uint)inputs.Length;

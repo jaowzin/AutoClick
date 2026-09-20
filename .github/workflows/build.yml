@@ -14,21 +14,17 @@ jobs:
     steps:
       - name: Baixar código
         uses: actions/checkout@v4
-
       - name: Instalar .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-
       - name: Compilar EXE portátil para Windows x64
-        run: dotnet publish AutoClick.csproj --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:PublishTrimmed=false -p:DebugType=none -p:DebugSymbols=false --output dist
-
+        run: dotnet publish AutoClick.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:PublishTrimmed=false -p:DebugType=none -p:DebugSymbols=false -o dist
       - name: Validar o executável
         shell: pwsh
         run: |
           if (-not (Test-Path 'dist/AutoClick.exe')) { throw 'AutoClick.exe não foi gerado.' }
           Get-Item 'dist/AutoClick.exe' | Select-Object Name, Length
-
       - name: Disponibilizar download
         uses: actions/upload-artifact@v4
         with:

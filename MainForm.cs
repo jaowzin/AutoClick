@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
@@ -28,69 +29,57 @@ internal sealed class MainForm : Form
         TextAlign = HorizontalAlignment.Center
     };
 
-    private readonly CheckBox _suppressOriginal = new()
-    {
-        Location = new Point(20, 83),
-        Size = new Size(348, 34),
-        Text = "Bloquear a ação original do lateral (voltar/avançar)",
-        Checked = true
-    };
-
     private readonly Label _status = new()
     {
-        Location = new Point(20, 126),
-        Size = new Size(350, 34),
+        Location = new Point(20, 83),
+        Size = new Size(350, 56),
         AutoSize = false
     };
 
     private readonly Button _toggle = new()
     {
-        Location = new Point(20, 170),
+        Location = new Point(20, 146),
         Size = new Size(347, 38),
         Text = "Ativar autoclick",
         Enabled = false
     };
 
-    private readonly System.Windows.Forms.Timer _timer = new();
+    // Timer verifica o botão físico a cada tick; a cadência dos cliques é
+    // controlada separadamente pelo relógio monotônico.
+    private readonly System.Windows.Forms.Timer _timer = new() { Interval = 10 };
+    private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly HoldState _hold = new();
-    private readonly MouseHook _hook;
+    private long _lastClickMs = -1;
     private bool _ready;
 
     public MainForm()
     {
         Text = "AutoClick - Lateral → clique esquerdo";
-        ClientSize = new Size(387, 225);
+        ClientSize = new Size(387, 201);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
 
         Controls.Add(new Label { Location = new Point(20, 17), AutoSize = true, Text = "Botão que ativa" });
         Controls.Add(new Label { Location = new Point(272, 17), AutoSize = true, Text = "Cliques/seg." });
-        Controls.AddRange(new Control[] { _sideButton, _clicksPerSecond, _suppressOriginal, _status, _toggle });
+        Controls.AddRange(new Control[] { _sideButton, _clicksPerSecond, _status, _toggle });
 
         _sideButton.Items.AddRange(new object[] { "Lateral 1 (Voltar)", "Lateral 2 (Avançar)" });
         _sideButton.SelectedIndex = 0;
-        _timer.Interval = 1000 / (int)_clicksPerSecond.Value;
-        _timer.Tick += (_, _) => SendLeftClick(checkPhysicalState: true);
-        _clicksPerSecond.ValueChanged += (_, _) =>
-            _timer.Interval = Math.Max(1, (int)Math.Round(1000m / _clicksPerSecond.Value));
+        _timer.Tick += (_, _) => CheckAndClick();
         _sideButton.SelectedIndexChanged += (_, _) =>
         {
             _hold.SelectButton(_sideButton.SelectedIndex + 1);
             StopClicking();
         };
-
         _toggle.Click += (_, _) =>
         {
             _timer.Stop();
             _hold.SetEnabled(!_hold.Enabled);
+            _lastClickMs = -1;
             _toggle.Text = _hold.Enabled ? "Pausar autoclick" : "Ativar autoclick";
             UpdateStatus();
         };
-
-        // Hook só observa a soltura do lateral e opcionalmente bloqueia Voltar/Avançar.
-        // Jamais intercepta o clique direito ou esquerdo físico.
-        _hook = new MouseHook(OnSideButton);
         UpdateStatus();
     }
 
@@ -100,7 +89,6 @@ internal sealed class MainForm : Form
         try
         {
             RawMouseInput.Register(Handle);
-            _hook.Start();
             _ready = true;
             _toggle.Enabled = true;
         }
@@ -121,15 +109,14 @@ internal sealed class MainForm : Form
         if (m.Msg == RawMouseInput.WmInput && _ready &&
             RawMouseInput.TryGetButtonFlags(m.LParam, out ushort flags))
         {
-            // WM_INPUT relata o lateral físico e o estado do esquerdo REAL,
-            // sem confundir cliques que nós próprios injetamos.
-            var transition = _hold.OnRawMouseButtons(flags);
-            switch (transition)
+            switch (_hold.OnRawMouseButtons(flags))
             {
                 case HoldState.Transition.Started:
+                    // NÃO injeta imediatamente: aguarda o estado de XBUTTON
+                    // ser atualizado pelo Windows e validado no próximo tick.
+                    _lastClickMs = -1;
                     _timer.Start();
                     UpdateStatus();
-                    SendLeftClick(checkPhysicalState: false);
                     break;
                 case HoldState.Transition.Stopped:
                     StopClicking();
@@ -140,51 +127,53 @@ internal sealed class MainForm : Form
                     break;
             }
         }
-
         base.WndProc(ref m);
     }
 
-    private bool OnSideButton(int button, bool down)
+    private void CheckAndClick()
     {
-        if (button == _hold.SelectedButton && !down)
-            StopClicking(); // Redundância caso a soltura não chegue pelo Raw Input.
-
-        return _hold.Enabled && button == _hold.SelectedButton && _suppressOriginal.Checked;
-    }
-
-    private void SendLeftClick(bool checkPhysicalState)
-    {
-        if (!_ready || !_hold.CanClick)
-            return;
-
-        // Nunca injeta LEFTUP enquanto o esquerdo real está segurado: evita
-        // cancelar disparo contínuo/arrastar selecionado pelo usuário.
-        if ((GetAsyncKeyState(VkLeftButton) & 0x8000) != 0)
-            return;
-
-        // Sem bloqueio do lateral, o estado do Windows serve como verificação extra.
-        // Com bloqueio, GetAsyncKeyState pode não atualizar: WM_INPUT e hook cuidam do UP.
-        if (checkPhysicalState && !_suppressOriginal.Checked)
+        if (!_ready || !_hold.Enabled || !_hold.Held)
         {
-            int key = _hold.SelectedButton == 1 ? VkXButton1 : VkXButton2;
-            if ((GetAsyncKeyState(key) & 0x8000) == 0)
-            {
-                StopClicking();
-                return;
-            }
+            StopClicking();
+            return;
         }
+
+        // A verificação física é OBRIGATÓRIA em TODOS os cliques. Não há
+        // hook para bloquear o lateral, pois ele pode impedir a atualização
+        // de GetAsyncKeyState e deixar o autoclick preso após soltar.
+        int side = _hold.SelectedButton == 1 ? VkXButton1 : VkXButton2;
+        if ((GetAsyncKeyState(side) & 0x8000) == 0)
+        {
+            StopClicking();
+            return;
+        }
+
+        // Não envia LEFTUP sintético sobre um botão esquerdo real segurado.
+        // O direito físico nunca é capturado nem alterado.
+        if (!_hold.CanClick || (GetAsyncKeyState(VkLeftButton) & 0x8000) != 0)
+            return;
+
+        long nowMs = _clock.ElapsedMilliseconds;
+        double minIntervalMs = 1000.0 / (double)_clicksPerSecond.Value;
+        if (_lastClickMs >= 0 && nowMs - _lastClickMs < minIntervalMs)
+            return;
 
         if (!MouseSender.LeftClick())
         {
+            _hold.SetEnabled(false); // Em erro, falha fechado.
             StopClicking();
-            _status.Text = "Windows bloqueou o clique. Verifique as permissões da janela.";
+            _toggle.Text = "Ativar autoclick";
+            _status.Text = "Falha ao enviar clique; autoclick pausado por segurança.";
+            return;
         }
+        _lastClickMs = _clock.ElapsedMilliseconds;
     }
 
     private void StopClicking()
     {
         _timer.Stop();
         _hold.Stop();
+        _lastClickMs = -1;
         UpdateStatus();
     }
 
@@ -197,15 +186,14 @@ internal sealed class MainForm : Form
                 : _hold.Held && _hold.PhysicalLeftHeld
                     ? "Esquerdo físico pressionado: autoclick suspenso."
                     : _hold.Held
-                        ? "Clicando esquerdo... Solte o lateral para parar."
-                        : "Pronto. Segure o lateral; direito segue para mirar.";
+                        ? "Segurando lateral: clique esquerdo automático."
+                        : "Pronto. Segure o lateral; direito livre para mirar.\nO lateral mantém sua ação original (Voltar/Avançar).";
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         _timer.Stop();
         _hold.SetEnabled(false);
-        _hook.Dispose();
         _timer.Dispose();
         base.OnFormClosed(e);
     }

@@ -2,6 +2,8 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace AutoClick;
@@ -11,6 +13,10 @@ internal sealed class MainForm : Form
     private const int VkXButton1 = 0x05;
     private const int VkXButton2 = 0x06;
     private const int VkLeftButton = 0x01;
+    private const int WmHotkey = 0x0312;
+    private const int PanicHotkeyId = 0xAC01;
+    private const uint ModControlAlt = 0x0002 | 0x0001;
+    private const uint VkF12 = 0x7B;
 
     private readonly ComboBox _sideButton = new()
     {
@@ -24,38 +30,47 @@ internal sealed class MainForm : Form
         Location = new Point(272, 40),
         Size = new Size(95, 28),
         Minimum = 1,
-        Maximum = 40,
+        Maximum = 1000,
         Value = 12,
-        TextAlign = HorizontalAlignment.Center
+        TextAlign = HorizontalAlignment.Center,
+        ThousandsSeparator = true
     };
 
     private readonly Label _status = new()
     {
         Location = new Point(20, 83),
-        Size = new Size(350, 56),
+        Size = new Size(350, 65),
         AutoSize = false
     };
 
     private readonly Button _toggle = new()
     {
-        Location = new Point(20, 146),
+        Location = new Point(20, 154),
         Size = new Size(347, 38),
         Text = "Ativar autoclick",
         Enabled = false
     };
 
-    // O timer verifica a pressão física a cada tick; um relógio separado
-    // controla a cadência dos cliques sem perder a verificação de soltura.
-    private readonly System.Windows.Forms.Timer _timer = new() { Interval = 10 };
-    private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly HoldState _hold = new();
-    private long _lastClickMs = -1;
+    private readonly NotifyIcon _trayIcon = new();
+    private readonly ContextMenuStrip _trayMenu = new();
+    private readonly ToolStripMenuItem _trayToggle = new("Ativar autoclick");
+    private readonly ToolStripMenuItem _trayOpen = new("Abrir AutoClick");
+    private readonly ToolStripMenuItem _trayExit = new("Sair completamente");
+
+    // Alterados somente na thread da interface; o trabalhador consulta apenas
+    // o token de cancelamento, o snapshot do botão e a taxa volátil.
+    private CancellationTokenSource? _clickCancellation;
+    private int _clickSession;
+    private int _requestedCps = 12;
     private bool _ready;
+    private bool _reallyExit;
+    private bool _hotkeyRegistered;
 
     public MainForm()
     {
         Text = "AutoClick - Lateral → clique esquerdo";
-        ClientSize = new Size(387, 201);
+        ClientSize = new Size(387, 210);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -66,20 +81,32 @@ internal sealed class MainForm : Form
 
         _sideButton.Items.AddRange(new object[] { "Lateral 1 (Voltar)", "Lateral 2 (Avançar)" });
         _sideButton.SelectedIndex = 0;
-        _timer.Tick += (_, _) => CheckAndClick();
         _sideButton.SelectedIndexChanged += (_, _) =>
         {
-            _hold.SelectButton(_sideButton.SelectedIndex + 1);
             StopClicking();
-        };
-        _toggle.Click += (_, _) =>
-        {
-            _timer.Stop();
-            _hold.SetEnabled(!_hold.Enabled);
-            _lastClickMs = -1;
-            _toggle.Text = _hold.Enabled ? "Pausar autoclick" : "Ativar autoclick";
+            _hold.SelectButton(_sideButton.SelectedIndex + 1);
             UpdateStatus();
         };
+        _clicksPerSecond.ValueChanged += (_, _) =>
+            Volatile.Write(ref _requestedCps, (int)_clicksPerSecond.Value);
+        _toggle.Click += (_, _) => ToggleEnabled();
+
+        _trayOpen.Click += (_, _) => RestoreWindow();
+        _trayToggle.Click += (_, _) => ToggleEnabled();
+        _trayExit.Click += (_, _) =>
+        {
+            _reallyExit = true;
+            Close();
+        };
+        _trayMenu.Items.AddRange(new ToolStripItem[]
+        {
+            _trayOpen, _trayToggle, new ToolStripSeparator(), _trayExit
+        });
+        _trayIcon.Icon = SystemIcons.Application;
+        _trayIcon.Text = "AutoClick (pausado)";
+        _trayIcon.ContextMenuStrip = _trayMenu;
+        _trayIcon.DoubleClick += (_, _) => RestoreWindow();
+        _trayIcon.Visible = true;
         UpdateStatus();
     }
 
@@ -89,13 +116,14 @@ internal sealed class MainForm : Form
         try
         {
             RawMouseInput.Register(Handle);
+            _hotkeyRegistered = RegisterHotKey(Handle, PanicHotkeyId, ModControlAlt, VkF12);
             _ready = true;
             _toggle.Enabled = true;
         }
         catch (Win32Exception ex)
         {
             _ready = false;
-            _timer.Stop();
+            StopClicking();
             _hold.SetEnabled(false);
             _toggle.Enabled = false;
             MessageBox.Show(this, ex.Message, "AutoClick: erro de inicialização",
@@ -106,17 +134,19 @@ internal sealed class MainForm : Form
 
     protected override void WndProc(ref Message m)
     {
+        if (m.Msg == WmHotkey && m.WParam == (IntPtr)PanicHotkeyId)
+        {
+            Pause(); // Atalho de emergência mesmo com janela escondida.
+            return;
+        }
+
         if (m.Msg == RawMouseInput.WmInput && _ready &&
             RawMouseInput.TryGetButtonFlags(m.LParam, out ushort flags))
         {
             switch (_hold.OnRawMouseButtons(flags))
             {
                 case HoldState.Transition.Started:
-                    // Aguarda o estado de XBUTTON atualizar e verifica no timer.
-                    // Nunca injeta clique só porque chegou um evento DOWN.
-                    _lastClickMs = -1;
-                    _timer.Start();
-                    UpdateStatus();
+                    StartClicking();
                     break;
                 case HoldState.Transition.Stopped:
                     StopClicking();
@@ -130,75 +160,201 @@ internal sealed class MainForm : Form
         base.WndProc(ref m);
     }
 
-    private void CheckAndClick()
+    private void ToggleEnabled()
     {
-        if (!_ready || !_hold.Enabled || !_hold.Held)
+        if (!_ready) return;
+        StopClicking();
+        _hold.SetEnabled(!_hold.Enabled);
+        UpdateStatus();
+    }
+
+    private void Pause()
+    {
+        StopClicking();
+        _hold.SetEnabled(false);
+        UpdateStatus();
+    }
+
+    private void StartClicking()
+    {
+        CancelWorker();
+        if (!_ready || !_hold.CanClick)
         {
-            StopClicking();
+            UpdateStatus();
             return;
         }
-
-        // Confirma o botão lateral real ANTES DE CADA CLIQUE. Sem hook de
-        // bloqueio, o estado assíncrono do Windows continua confiável.
+        var cancellation = new CancellationTokenSource();
+        _clickCancellation = cancellation;
+        int session = Interlocked.Increment(ref _clickSession);
         int side = _hold.SelectedButton == 1 ? VkXButton1 : VkXButton2;
-        bool sideDown = (GetAsyncKeyState(side) & 0x8000) != 0;
-        if (!sideDown)
+        _ = Task.Run(() => ClickLoop(side, session, cancellation));
+        UpdateStatus();
+    }
+
+    private void ClickLoop(int side, int session, CancellationTokenSource cancellation)
+    {
+        try
         {
-            StopClicking();
-            return;
+            var token = cancellation.Token;
+            long nextClick = Stopwatch.GetTimestamp();
+            while (!token.IsCancellationRequested && session == Volatile.Read(ref _clickSession))
+            {
+                // Falha fechada: conferir botão LATERAL real em todas as voltas,
+                // inclusive quando o evento de soltura WM_INPUT for perdido.
+                if ((GetAsyncKeyState(side) & 0x8000) == 0)
+                {
+                    NotifyWorkerStopped(session, null);
+                    return;
+                }
+
+                // Nunca envia LEFTUP sintético enquanto o esquerdo real é segurado.
+                if ((GetAsyncKeyState(VkLeftButton) & 0x8000) != 0)
+                {
+                    nextClick = Stopwatch.GetTimestamp();
+                    Thread.Sleep(1);
+                    continue;
+                }
+
+                long now = Stopwatch.GetTimestamp();
+                long until = nextClick - now;
+                if (until > 0)
+                {
+                    // Não usa o timer da UI: 100+ CPS exigem cadência dedicada.
+                    // O rendimento real depende do escalonador e do jogo.
+                    if (until > Stopwatch.Frequency / 500)
+                        Thread.Sleep(1);
+                    else if (until > Stopwatch.Frequency / 2000)
+                        Thread.Sleep(0);
+                    else
+                        Thread.SpinWait(64);
+                    continue;
+                }
+
+                // Reconfere após aguardar: jamais iniciar um clique com o
+                // botão lateral já solto ou com sessão cancelada.
+                if (token.IsCancellationRequested || session != Volatile.Read(ref _clickSession))
+                    return;
+                if ((GetAsyncKeyState(side) & 0x8000) == 0)
+                {
+                    NotifyWorkerStopped(session, null);
+                    return;
+                }
+                if ((GetAsyncKeyState(VkLeftButton) & 0x8000) != 0)
+                    continue;
+
+                if (!MouseSender.LeftClick())
+                {
+                    NotifyWorkerStopped(session, "Windows não confirmou o clique. Autoclick pausado.");
+                    return;
+                }
+
+                // Não acumula cliques atrasados nem despeja uma rajada na UI.
+                int cps = Math.Clamp(Volatile.Read(ref _requestedCps), 1, 1000);
+                long interval = Math.Max(1L, Stopwatch.Frequency / cps);
+                nextClick = Stopwatch.GetTimestamp() + interval;
+            }
         }
-
-        // Não solta virtualmente o esquerdo físico que a pessoa está segurando.
-        // Botão direito não é interceptado, reconfigurado nem enviado.
-        bool leftDown = (GetAsyncKeyState(VkLeftButton) & 0x8000) != 0;
-        if (!_hold.CanClickWithPhysicalState(sideDown, leftDown))
-            return;
-
-        long nowMs = _clock.ElapsedMilliseconds;
-        double minIntervalMs = 1000.0 / (double)_clicksPerSecond.Value;
-        if (_lastClickMs >= 0 && nowMs - _lastClickMs < minIntervalMs)
-            return;
-
-        if (!MouseSender.LeftClick())
+        catch (Exception)
         {
-            _hold.SetEnabled(false); // Falha fechado se SendInput não confirmar.
-            StopClicking();
-            _toggle.Text = "Ativar autoclick";
-            _status.Text = "Falha ao enviar clique; autoclick pausado por segurança.";
-            return;
+            NotifyWorkerStopped(session, "Erro no motor de cliques. Autoclick pausado.");
         }
-        _lastClickMs = _clock.ElapsedMilliseconds;
+        finally
+        {
+            cancellation.Dispose();
+        }
+    }
+
+    private void NotifyWorkerStopped(int session, string? error)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        try
+        {
+            BeginInvoke((Action)(() =>
+            {
+                // Não cancela uma pressão NOVA devido a um callback antigo.
+                if (session != Volatile.Read(ref _clickSession)) return;
+                if (error is null)
+                    StopClicking();
+                else
+                {
+                    Pause();
+                    _status.Text = error;
+                }
+            }));
+        }
+        catch (InvalidOperationException) { /* A janela foi encerrada. */ }
+    }
+
+    private void CancelWorker()
+    {
+        Interlocked.Increment(ref _clickSession);
+        _clickCancellation?.Cancel();
+        _clickCancellation = null;
     }
 
     private void StopClicking()
     {
-        _timer.Stop();
+        CancelWorker();
         _hold.Stop();
-        _lastClickMs = -1;
         UpdateStatus();
     }
 
     private void UpdateStatus()
     {
+        bool enabled = _ready && _hold.Enabled;
+        _toggle.Text = enabled ? "Pausar autoclick" : "Ativar autoclick";
+        _trayToggle.Text = _toggle.Text;
+        _trayToggle.Enabled = _ready;
+        _trayIcon.Text = enabled ? "AutoClick (ativo)" : "AutoClick (pausado)";
         _status.Text = !_ready
             ? "Inicializando... autoclick desativado."
-            : !_hold.Enabled
-                ? "Pausado. Clique em Ativar para habilitar."
+            : !enabled
+                ? "Pausado. Ative para usar. Ctrl+Alt+F12: pausa de emergência."
                 : _hold.Held && _hold.PhysicalLeftHeld
                     ? "Esquerdo físico pressionado: autoclick suspenso."
                     : _hold.Held
                         ? "Segurando lateral: clique esquerdo automático."
-                        : "Pronto. Segure o lateral; direito livre para mirar.\nO lateral mantém sua ação original (Voltar/Avançar).";
+                        : "Segure o lateral para clicar. X: manter na bandeja.\nCtrl+Alt+F12: pausa de emergência.";
+    }
+
+    private void RestoreWindow()
+    {
+        Show();
+        ShowInTaskbar = true;
+        WindowState = FormWindowState.Normal;
+        Activate();
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (!_reallyExit && e.CloseReason == CloseReason.UserClosing)
+        {
+            e.Cancel = true;
+            Hide();
+            ShowInTaskbar = false;
+            return;
+        }
+        base.OnFormClosing(e);
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
-        _timer.Stop();
-        _hold.SetEnabled(false);
-        _timer.Dispose();
+        Pause();
+        if (_hotkeyRegistered) UnregisterHotKey(Handle, PanicHotkeyId);
+        _trayIcon.Visible = false;
+        _trayIcon.Dispose();
+        _trayMenu.Dispose();
         base.OnFormClosed(e);
     }
 
     [DllImport("user32.dll")]
     private static extern short GetAsyncKeyState(int virtualKey);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RegisterHotKey(IntPtr window, int id, uint modifiers, uint key);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnregisterHotKey(IntPtr window, int id);
 }

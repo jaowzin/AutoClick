@@ -15,7 +15,7 @@ internal sealed class MainForm : Form
     private const int VkLeftButton = 0x01;
     private const int WmHotkey = 0x0312;
     private const int PanicHotkeyId = 0xAC01;
-    private const uint ModControlAlt = 0x0002 | 0x0001;
+    private const uint ModControlAlt = 0x0003;
     private const uint VkF12 = 0x7B;
 
     private readonly ComboBox _sideButton = new()
@@ -57,9 +57,6 @@ internal sealed class MainForm : Form
     private readonly ToolStripMenuItem _trayToggle = new("Ativar autoclick");
     private readonly ToolStripMenuItem _trayOpen = new("Abrir AutoClick");
     private readonly ToolStripMenuItem _trayExit = new("Sair completamente");
-
-    // Alterados somente na thread da interface; o trabalhador consulta apenas
-    // o token de cancelamento, o snapshot do botão e a taxa volátil.
     private CancellationTokenSource? _clickCancellation;
     private int _clickSession;
     private int _requestedCps = 12;
@@ -136,10 +133,9 @@ internal sealed class MainForm : Form
     {
         if (m.Msg == WmHotkey && m.WParam == (IntPtr)PanicHotkeyId)
         {
-            Pause(); // Atalho de emergência mesmo com janela escondida.
+            Pause(); // Funciona também com a janela escondida.
             return;
         }
-
         if (m.Msg == RawMouseInput.WmInput && _ready &&
             RawMouseInput.TryGetButtonFlags(m.LParam, out ushort flags))
         {
@@ -184,30 +180,37 @@ internal sealed class MainForm : Form
             return;
         }
         var cancellation = new CancellationTokenSource();
+        CancellationToken token = cancellation.Token; // Captura ANTES de eventual Dispose.
         _clickCancellation = cancellation;
         int session = Interlocked.Increment(ref _clickSession);
         int side = _hold.SelectedButton == 1 ? VkXButton1 : VkXButton2;
-        _ = Task.Run(() => ClickLoop(side, session, cancellation));
+        _ = Task.Factory.StartNew(() => ClickLoop(side, session, token),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         UpdateStatus();
     }
 
-    private void ClickLoop(int side, int session, CancellationTokenSource cancellation)
+    private void ClickLoop(int side, int session, CancellationToken token)
     {
         try
         {
-            var token = cancellation.Token;
             long nextClick = Stopwatch.GetTimestamp();
+            long startedAt = nextClick;
             while (!token.IsCancellationRequested && session == Volatile.Read(ref _clickSession))
             {
-                // Falha fechada: conferir botão LATERAL real em todas as voltas,
-                // inclusive quando o evento de soltura WM_INPUT for perdido.
+                // O estado físico é a autoridade, mesmo com perda de WM_INPUT.
                 if ((GetAsyncKeyState(side) & 0x8000) == 0)
                 {
+                    // Pequena janela inicial para o Windows atualizar XBUTTON.
+                    if (Stopwatch.GetTimestamp() - startedAt < Stopwatch.Frequency / 50)
+                    {
+                        Thread.Sleep(1);
+                        continue;
+                    }
                     NotifyWorkerStopped(session, null);
                     return;
                 }
+                startedAt = long.MinValue / 2; // Após confirmar, qualquer soltura para.
 
-                // Nunca envia LEFTUP sintético enquanto o esquerdo real é segurado.
                 if ((GetAsyncKeyState(VkLeftButton) & 0x8000) != 0)
                 {
                     nextClick = Stopwatch.GetTimestamp();
@@ -215,12 +218,9 @@ internal sealed class MainForm : Form
                     continue;
                 }
 
-                long now = Stopwatch.GetTimestamp();
-                long until = nextClick - now;
+                long until = nextClick - Stopwatch.GetTimestamp();
                 if (until > 0)
                 {
-                    // Não usa o timer da UI: 100+ CPS exigem cadência dedicada.
-                    // O rendimento real depende do escalonador e do jogo.
                     if (until > Stopwatch.Frequency / 500)
                         Thread.Sleep(1);
                     else if (until > Stopwatch.Frequency / 2000)
@@ -230,8 +230,6 @@ internal sealed class MainForm : Form
                     continue;
                 }
 
-                // Reconfere após aguardar: jamais iniciar um clique com o
-                // botão lateral já solto ou com sessão cancelada.
                 if (token.IsCancellationRequested || session != Volatile.Read(ref _clickSession))
                     return;
                 if ((GetAsyncKeyState(side) & 0x8000) == 0)
@@ -247,20 +245,14 @@ internal sealed class MainForm : Form
                     NotifyWorkerStopped(session, "Windows não confirmou o clique. Autoclick pausado.");
                     return;
                 }
-
-                // Não acumula cliques atrasados nem despeja uma rajada na UI.
                 int cps = Math.Clamp(Volatile.Read(ref _requestedCps), 1, 1000);
-                long interval = Math.Max(1L, Stopwatch.Frequency / cps);
-                nextClick = Stopwatch.GetTimestamp() + interval;
+                nextClick = Stopwatch.GetTimestamp() + Math.Max(1L, Stopwatch.Frequency / cps);
+                // Nunca acumula cliques atrasados para dispará-los em rajada.
             }
         }
         catch (Exception)
         {
             NotifyWorkerStopped(session, "Erro no motor de cliques. Autoclick pausado.");
-        }
-        finally
-        {
-            cancellation.Dispose();
         }
     }
 
@@ -271,7 +263,6 @@ internal sealed class MainForm : Form
         {
             BeginInvoke((Action)(() =>
             {
-                // Não cancela uma pressão NOVA devido a um callback antigo.
                 if (session != Volatile.Read(ref _clickSession)) return;
                 if (error is null)
                     StopClicking();
@@ -288,8 +279,13 @@ internal sealed class MainForm : Form
     private void CancelWorker()
     {
         Interlocked.Increment(ref _clickSession);
-        _clickCancellation?.Cancel();
+        var old = _clickCancellation;
         _clickCancellation = null;
+        if (old is not null)
+        {
+            old.Cancel();
+            old.Dispose(); // Thread utiliza apenas CancellationToken, não o CTS.
+        }
     }
 
     private void StopClicking()
